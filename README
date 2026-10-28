@@ -1,0 +1,119 @@
+# README - Protocol de transport peste UDP
+
+## Stabilirea conexiunii
+
+Pentru stabilirea conexiunii am implementat un mecanism de tip Three Way Handshake.
+
+Clientul trimite un segment `SYN` către server. Serverul primește acest segment pe socket-ul de ascultare, creează o conexiune nouă, alocă un `conn_id` și deschide un socket UDP separat pentru transferul de date. Apoi serverul trimite înapoi un segment `SYN_ACK`, în care include portul pe care se va face transferul efectiv.
+
+După ce clientul primește `SYN_ACK`, acesta actualizează adresa serverului cu noul port și trimite segmentul final de `ACK`. După acest pas, conexiunea este considerată stabilită.
+
+## Trimiterea datelor
+
+În `send_data`, datele primite de la aplicație sunt împărțite în segmente de maximum `MAX_DATA_SIZE`, adică 512 bytes. Fiecare segment primește un număr de secvență și este pus în bufferul intern al senderului.
+
+Funcția `send_data` nu blochează. Dacă nu mai există suficient spațiu în bufferul intern de transmisie, funcția întoarce `-1`, conform cerinței.
+
+Senderul trimite segmentele în funcție de fereastra disponibilă. Astfel, nu se așteaptă confirmarea fiecărui segment înainte de a-l trimite pe următorul.
+
+## Fereastra de transmisie
+
+Senderul folosește o fereastră de transmisie calculată în funcție de viteza și delay-ul primite în `init_sender`.
+
+Am aproximat dimensiunea ferestrei pe baza produsului bandwidth-delay:
+
+```text
+RTT = 2 * delay
+window = bandwidth * RTT / MAX_DATA_SIZE
+```
+
+Fereastra este folosită pentru a avea mai multe segmente în zbor în același timp. Acest lucru ajută la folosirea mai eficientă a link-ului, mai ales când există latență.
+
+În plus, senderul ține cont și de fereastra anunțată de receiver prin câmpul `recv_window`, astfel încât să nu trimită mai multe date decât poate stoca receptorul.
+
+## Recepția datelor
+
+Pe partea de receiver, fiecare segment primit este verificat înainte de a fi acceptat.
+
+Receiverul verifică:
+
+* dacă pachetul aparține protocolului;
+* dacă este un segment de tip `TYPE_DATA`;
+* dacă lungimea segmentului este validă;
+* dacă segmentul se află în fereastra de recepție;
+* dacă există spațiu disponibil în buffer.
+
+Segmentele primite sunt păstrate până când pot fi livrate în ordine către aplicație. Dacă un segment ajunge mai devreme decât un segment lipsă, acesta este reținut temporar și va fi livrat după ce ajung toate segmentele anterioare.
+
+## ACK-uri cumulative
+
+Receiverul trimite ACK-uri cumulative. Câmpul `ack_num` reprezintă următorul număr de secvență așteptat.
+
+De exemplu, dacă receiverul a primit corect segmentele `0`, `1` și `2`, acesta va trimite:
+
+```text
+ACK 3
+```
+
+Acest mecanism simplifică partea de sender, deoarece la primirea unui ACK se pot considera confirmate toate segmentele cu număr de secvență mai mic decât `ack_num`.
+
+## Retransmisii
+
+Pentru a asigura fiabilitatea peste UDP, am implementat retransmisii.
+
+Fiecare conexiune are asociat un timer. Dacă timerul expiră, senderul retransmite segmentele trimise care nu au fost încă confirmate.
+
+Am folosit și retransmisie rapidă la ACK-uri duplicate. Dacă senderul primește același ACK de mai multe ori, înseamnă că un segment probabil s-a pierdut, iar primul segment neconfirmat este retransmis mai repede, fără a aștepta timeout-ul.
+
+## recv_data
+
+Funcția `recv_data` este echivalentul lui `recv`. Aceasta se blochează până când există date disponibile pentru aplicație.
+
+Când există date în bufferul intern de recepție, funcția copiază în bufferul primit ca parametru cel mult `len` bytes și returnează numărul de bytes citiți.
+
+După ce aplicația citește datele, spațiul disponibil în bufferul receiverului crește, iar receiverul trimite un ACK nou cu fereastra actualizată.
+
+## Conexiuni multiple
+
+Protocolul suportă mai multe conexiuni simultan.
+
+Pentru fiecare conexiune se păstrează separat:
+
+* `conn_id`;
+* socket-ul de date;
+* numerele de secvență;
+* bufferul de transmisie sau recepție;
+* timerul;
+* mutexul pentru sincronizare.
+
+Conexiunile sunt păstrate într-un map global:
+
+```cpp
+std::map<int, struct connection *> cons;
+```
+
+Pentru a urmări evenimentele de pe mai multe conexiuni se folosește `poll`, împreună cu descriptorii pentru socket-uri și timere.
+
+## Sincronizare
+
+Deoarece există threaduri care procesează pachetele în paralel cu apelurile `send_data` și `recv_data`, accesul la structura conexiunii este protejat cu mutex.
+
+Astfel se evită situațiile în care două threaduri modifică în același timp bufferul, fereastra sau numerele de secvență.
+
+## De ce implementarea este eficientă
+
+Implementarea este eficientă deoarece folosește o fereastră atât la sender, cât și la receiver. Astfel, protocolul nu trimite un singur segment și apoi așteaptă ACK, ci poate ține mai multe segmente în zbor.
+
+Fereastra de transmisie este calculată în funcție de viteza și delay-ul legăturii, ceea ce ajută la utilizarea mai bună a link-ului.
+
+ACK-urile cumulative reduc numărul de confirmări necesare și simplifică eliberarea segmentelor confirmate din bufferul senderului.
+
+Retransmisia la timeout asigură corectitudinea în cazul pierderilor de pachete, iar retransmisia la ACK-uri duplicate poate recupera mai repede unele pierderi.
+
+Folosirea `poll` permite gestionarea mai multor conexiuni fără a fi nevoie de un thread separat pentru fiecare conexiune.
+
+## Concluzie
+
+Protocolul implementat peste UDP permite transmiterea fiabilă a fișierelor de la client la server. Implementarea tratează atât fișiere text, cât și imagini, iar corectitudinea este dată de faptul că fișierul recepționat trebuie să fie identic cu cel trimis.
+
+Soluția folosește mecanisme similare cu TCP, precum Three Way Handshake, sliding window, ACK-uri cumulative, retransmisii și control de flux.
