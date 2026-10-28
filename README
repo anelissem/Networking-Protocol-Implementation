@@ -1,119 +1,286 @@
-# README - Protocol de transport peste UDP
+# Reliable Transport Protocol over UDP
 
-## Stabilirea conexiunii
+A custom reliable transport protocol built on top of UDP, providing connection establishment, ordered delivery, flow control, retransmissions, and support for multiple concurrent connections.
 
-Pentru stabilirea conexiunii am implementat un mecanism de tip Three Way Handshake.
+The protocol implements several mechanisms commonly associated with reliable transport protocols while preserving UDP as the underlying communication layer.
 
-Clientul trimite un segment `SYN` către server. Serverul primește acest segment pe socket-ul de ascultare, creează o conexiune nouă, alocă un `conn_id` și deschide un socket UDP separat pentru transferul de date. Apoi serverul trimite înapoi un segment `SYN_ACK`, în care include portul pe care se va face transferul efectiv.
+## Features
 
-După ce clientul primește `SYN_ACK`, acesta actualizează adresa serverului cu noul port și trimite segmentul final de `ACK`. După acest pas, conexiunea este considerată stabilită.
+- Three-way connection handshake
+- Reliable and ordered data delivery
+- Sliding transmission window
+- Bandwidth-delay based window sizing
+- Receiver flow control
+- Cumulative acknowledgements
+- Timeout-based retransmissions
+- Fast retransmit on duplicate ACKs
+- Out-of-order packet buffering
+- Non-blocking send operations
+- Blocking receive operations
+- Multiple simultaneous connections
+- Thread-safe connection state
+- Event-driven I/O using `poll`
 
-## Trimiterea datelor
+---
 
-În `send_data`, datele primite de la aplicație sunt împărțite în segmente de maximum `MAX_DATA_SIZE`, adică 512 bytes. Fiecare segment primește un număr de secvență și este pus în bufferul intern al senderului.
+## Protocol Architecture
 
-Funcția `send_data` nu blochează. Dacă nu mai există suficient spațiu în bufferul intern de transmisie, funcția întoarce `-1`, conform cerinței.
+The protocol operates above UDP and introduces its own connection and reliability mechanisms.
 
-Senderul trimite segmentele în funcție de fereastra disponibilă. Astfel, nu se așteaptă confirmarea fiecărui segment înainte de a-l trimite pe următorul.
+Each connection maintains independent state including:
 
-## Fereastra de transmisie
+- Connection identifier
+- UDP data socket
+- Sequence numbers
+- Transmission and receive buffers
+- Sender and receiver window state
+- Retransmission timer
+- Synchronization primitives
 
-Senderul folosește o fereastră de transmisie calculată în funcție de viteza și delay-ul primite în `init_sender`.
+UDP provides packet transport, while reliability, ordering, retransmission, and flow control are handled entirely by the protocol implementation.
 
-Am aproximat dimensiunea ferestrei pe baza produsului bandwidth-delay:
+---
 
-```text
-RTT = 2 * delay
-window = bandwidth * RTT / MAX_DATA_SIZE
-```
+## Connection Establishment
 
-Fereastra este folosită pentru a avea mai multe segmente în zbor în același timp. Acest lucru ajută la folosirea mai eficientă a link-ului, mai ales când există latență.
+Connections are established using a **three-way handshake**.
 
-În plus, senderul ține cont și de fereastra anunțată de receiver prin câmpul `recv_window`, astfel încât să nu trimită mai multe date decât poate stoca receptorul.
+The sequence is:
 
-## Recepția datelor
+1. The client sends a `SYN` segment to the server.
+2. The server creates a new connection and allocates a unique `conn_id`.
+3. A dedicated UDP socket is created for the connection.
+4. The server responds with `SYN_ACK`, including the UDP port assigned for data transfer.
+5. The client updates the server endpoint to the new port.
+6. The client sends the final `ACK`.
+7. The connection enters the established state.
 
-Pe partea de receiver, fiecare segment primit este verificat înainte de a fi acceptat.
+This separates the listening endpoint from the sockets responsible for active data transfers and allows the server to manage multiple connections independently.
 
-Receiverul verifică:
+---
 
-* dacă pachetul aparține protocolului;
-* dacă este un segment de tip `TYPE_DATA`;
-* dacă lungimea segmentului este validă;
-* dacă segmentul se află în fereastra de recepție;
-* dacă există spațiu disponibil în buffer.
+## Data Transmission
 
-Segmentele primite sunt păstrate până când pot fi livrate în ordine către aplicație. Dacă un segment ajunge mai devreme decât un segment lipsă, acesta este reținut temporar și va fi livrat după ce ajung toate segmentele anterioare.
+Application data passed to `send_data()` is divided into segments of at most:
 
-## ACK-uri cumulative
+`MAX_DATA_SIZE = 512 bytes`
 
-Receiverul trimite ACK-uri cumulative. Câmpul `ack_num` reprezintă următorul număr de secvență așteptat.
+Each segment is assigned a sequence number and stored in the sender's internal transmission buffer.
 
-De exemplu, dacă receiverul a primit corect segmentele `0`, `1` și `2`, acesta va trimite:
+`send_data()` is non-blocking. If insufficient space is available in the transmission buffer, the function returns `-1` instead of waiting for capacity to become available.
 
-```text
-ACK 3
-```
+The sender can transmit multiple segments before receiving acknowledgements, allowing several packets to remain in flight simultaneously.
 
-Acest mecanism simplifică partea de sender, deoarece la primirea unui ACK se pot considera confirmate toate segmentele cu număr de secvență mai mic decât `ack_num`.
+---
 
-## Retransmisii
+## Sliding Window
 
-Pentru a asigura fiabilitatea peste UDP, am implementat retransmisii.
+The sender uses a sliding transmission window to control the amount of unacknowledged data present in the network.
 
-Fiecare conexiune are asociat un timer. Dacă timerul expiră, senderul retransmite segmentele trimise care nu au fost încă confirmate.
+Its initial size is estimated using the **bandwidth-delay product**:
 
-Am folosit și retransmisie rapidă la ACK-uri duplicate. Dacă senderul primește același ACK de mai multe ori, înseamnă că un segment probabil s-a pierdut, iar primul segment neconfirmat este retransmis mai repede, fără a aștepta timeout-ul.
+`RTT = 2 × delay`
 
-## recv_data
+`window ≈ bandwidth × RTT / MAX_DATA_SIZE`
 
-Funcția `recv_data` este echivalentul lui `recv`. Aceasta se blochează până când există date disponibile pentru aplicație.
+This allows the sender to keep enough data in flight to make effective use of links with non-negligible latency.
 
-Când există date în bufferul intern de recepție, funcția copiază în bufferul primit ca parametru cel mult `len` bytes și returnează numărul de bytes citiți.
+The effective transmission window is also constrained by the receive window advertised by the receiver through `recv_window`.
 
-După ce aplicația citește datele, spațiul disponibil în bufferul receiverului crește, iar receiverul trimite un ACK nou cu fereastra actualizată.
+As a result, the sender cannot transmit more data than the receiver is currently capable of buffering.
 
-## Conexiuni multiple
+---
 
-Protocolul suportă mai multe conexiuni simultan.
+## Data Reception
 
-Pentru fiecare conexiune se păstrează separat:
+Incoming segments are validated before being accepted into the receive buffer.
 
-* `conn_id`;
-* socket-ul de date;
-* numerele de secvență;
-* bufferul de transmisie sau recepție;
-* timerul;
-* mutexul pentru sincronizare.
+The receiver verifies:
 
-Conexiunile sunt păstrate într-un map global:
+- Protocol identifier
+- Segment type
+- Segment length
+- Sequence number
+- Receive window boundaries
+- Available buffer capacity
 
-```cpp
-std::map<int, struct connection *> cons;
-```
+Valid segments may arrive out of order.
 
-Pentru a urmări evenimentele de pe mai multe conexiuni se folosește `poll`, împreună cu descriptorii pentru socket-uri și timere.
+Instead of discarding them, the receiver temporarily stores them until all preceding segments have arrived. Data is delivered to the application only when a contiguous sequence is available.
 
-## Sincronizare
+This guarantees ordered delivery even when UDP packets are reordered by the network.
 
-Deoarece există threaduri care procesează pachetele în paralel cu apelurile `send_data` și `recv_data`, accesul la structura conexiunii este protejat cu mutex.
+---
 
-Astfel se evită situațiile în care două threaduri modifică în același timp bufferul, fereastra sau numerele de secvență.
+## Cumulative Acknowledgements
 
-## De ce implementarea este eficientă
+The protocol uses cumulative acknowledgements.
 
-Implementarea este eficientă deoarece folosește o fereastră atât la sender, cât și la receiver. Astfel, protocolul nu trimite un singur segment și apoi așteaptă ACK, ci poate ține mai multe segmente în zbor.
+The `ack_num` field represents the next sequence number expected by the receiver.
 
-Fereastra de transmisie este calculată în funcție de viteza și delay-ul legăturii, ceea ce ajută la utilizarea mai bună a link-ului.
+For example, after successfully receiving segments:
 
-ACK-urile cumulative reduc numărul de confirmări necesare și simplifică eliberarea segmentelor confirmate din bufferul senderului.
+`0, 1, 2`
 
-Retransmisia la timeout asigură corectitudinea în cazul pierderilor de pachete, iar retransmisia la ACK-uri duplicate poate recupera mai repede unele pierderi.
+the receiver responds with:
 
-Folosirea `poll` permite gestionarea mai multor conexiuni fără a fi nevoie de un thread separat pentru fiecare conexiune.
+`ACK 3`
 
-## Concluzie
+This acknowledgement confirms that every segment with a sequence number lower than `3` has been received successfully.
 
-Protocolul implementat peste UDP permite transmiterea fiabilă a fișierelor de la client la server. Implementarea tratează atât fișiere text, cât și imagini, iar corectitudinea este dată de faptul că fișierul recepționat trebuie să fie identic cu cel trimis.
+Cumulative ACKs allow the sender to acknowledge and release multiple transmitted segments using a single control message.
 
-Soluția folosește mecanisme similare cu TCP, precum Three Way Handshake, sliding window, ACK-uri cumulative, retransmisii și control de flux.
+---
+
+## Reliability and Retransmission
+
+Reliability is implemented through retransmission mechanisms.
+
+### Timeout Retransmission
+
+Each active connection maintains a retransmission timer.
+
+If the timer expires before outstanding data is acknowledged, unacknowledged segments are retransmitted.
+
+This provides recovery when either data packets or acknowledgement packets are lost.
+
+### Fast Retransmit
+
+The sender also monitors duplicate acknowledgements.
+
+Repeated reception of the same ACK indicates that the receiver is still waiting for an earlier sequence number.
+
+When the duplicate ACK threshold is reached, the first unacknowledged segment can be retransmitted immediately instead of waiting for the retransmission timeout.
+
+This reduces recovery latency for certain packet-loss scenarios.
+
+---
+
+## Flow Control
+
+Receiver-side buffer availability is communicated through the advertised `recv_window`.
+
+The sender limits transmission according to the available receive capacity:
+
+`effective_window = min(sender_window, recv_window)`
+
+As application data is consumed, receive-buffer capacity becomes available again and the receiver advertises the updated window through subsequent acknowledgements.
+
+This prevents a fast sender from overwhelming a slower receiver.
+
+---
+
+## Application Receive Interface
+
+`recv_data()` provides the application-facing receive operation.
+
+The function blocks until ordered application data becomes available.
+
+Once data is ready:
+
+1. Up to `len` bytes are copied into the provided application buffer.
+2. The consumed data is removed from the internal receive buffer.
+3. Receive-buffer capacity is updated.
+4. The receiver advertises the newly available window.
+5. The number of bytes delivered to the application is returned.
+
+This presents the application with an ordered byte stream independently of the packet-level behavior of UDP.
+
+---
+
+## Multiple Connections
+
+The protocol supports multiple simultaneous connections.
+
+Each connection maintains its own:
+
+- `conn_id`
+- Data socket
+- Sequence state
+- Send and receive buffers
+- Sliding window state
+- Retransmission timer
+- Mutex
+
+Active connections are maintained in a global connection map:
+
+`std::map<int, struct connection *> cons`
+
+Network sockets and timer descriptors are monitored using `poll`.
+
+This event-driven approach allows the protocol to handle activity across multiple connections without requiring a dedicated thread for every individual connection.
+
+---
+
+## Concurrency and Synchronization
+
+Network processing and application calls may access connection state concurrently.
+
+Each connection therefore uses a mutex to protect shared state such as:
+
+- Transmission buffers
+- Receive buffers
+- Sequence numbers
+- Sliding window state
+- Acknowledgement state
+- Timers
+
+This prevents concurrent operations from modifying the same connection state inconsistently.
+
+---
+
+## Data Flow
+
+The transmission path can be summarized as:
+
+1. Application calls `send_data()`.
+2. Data is segmented into blocks of up to 512 bytes.
+3. Segments receive sequence numbers and enter the transmission buffer.
+4. The sender transmits segments permitted by the current window.
+5. The receiver validates and buffers incoming segments.
+6. Out-of-order segments remain buffered until missing data arrives.
+7. The receiver sends cumulative ACKs containing the next expected sequence number.
+8. The sender removes acknowledged segments from its buffer.
+9. Missing segments are recovered through timeout or fast retransmission.
+10. Ordered data becomes available through `recv_data()`.
+
+---
+
+## Design Overview
+
+| Component | Mechanism | Purpose |
+|---|---|---|
+| Connection setup | Three-way handshake | Establish connection state |
+| Segmentation | 512-byte segments | Transfer application data |
+| Ordering | Sequence numbers | Preserve data order |
+| Transmission | Sliding window | Allow multiple packets in flight |
+| Flow control | Advertised receive window | Protect receiver buffer capacity |
+| Acknowledgements | Cumulative ACKs | Confirm contiguous received data |
+| Loss recovery | Retransmission timeout | Recover lost packets |
+| Fast recovery | Duplicate ACK detection | Retransmit losses before timeout |
+| Reordering | Receive buffer | Handle out-of-order delivery |
+| Multiplexing | `poll` | Manage multiple connections |
+| Synchronization | Mutexes | Protect concurrent connection state |
+
+---
+
+## Technical Concepts
+
+- C / C++
+- UDP sockets
+- Reliable transport
+- Three-way handshake
+- Sliding window protocols
+- Bandwidth-delay product
+- Sequence numbers
+- Cumulative acknowledgements
+- Flow control
+- Retransmission timers
+- Fast retransmit
+- Out-of-order buffering
+- Non-blocking transmission
+- Event-driven I/O
+- `poll`
+- POSIX sockets
+- Multithreading
+- Mutex synchronization
